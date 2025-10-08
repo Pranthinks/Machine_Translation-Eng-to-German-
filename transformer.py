@@ -98,9 +98,4 @@ class FullTransformer_Custom(nn.Module):
         
 
         
-#Usage 
-obj = FullTransformer_Custom(10, 2, 4, 4, 4, 6)
-x = torch.randint(0,10, (2, 4))
-y = torch.randint(0, 10, (2, 3))
-output = obj(x, y)
-print(output)
+

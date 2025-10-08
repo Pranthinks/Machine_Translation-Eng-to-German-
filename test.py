@@ -12,6 +12,10 @@ from torch.nn.utils.rnn import pad_sequence
 import torch.optim as optim
 from torchtext.data.utils import get_tokenizer
 from torchtext.vocab import build_vocab_from_iterator
+from transformer import FullTransformer_Custom
+import math
+from itertools import islice
+
 
 # Loading the Data
 train_iter, valid_iter, test_iter = Multi30k(split=('train', 'valid', 'test'), language_pair=('en', 'de'))
@@ -70,9 +74,9 @@ def collate_fn(batch):
 
 #Now we has to write a Custom Dataloader that uses this collate function
 train_iter, valid_iter, test_iter = Multi30k(split=('train', 'valid', 'test'), language_pair=('en', 'de'))
-train_loader = DataLoader(train_iter, batch_size = 32, collate_fn=collate_fn)
-val_loader = DataLoader(valid_iter, batch_size = 32, collate_fn=collate_fn)
-test_loader = DataLoader(test_iter, batch_size = 32, collate_fn=collate_fn)
+train_loader = DataLoader(train_iter, batch_size = 8, collate_fn=collate_fn)
+val_loader = DataLoader(valid_iter, batch_size = 8, collate_fn=collate_fn)
+test_loader = DataLoader(test_iter, batch_size = 8, collate_fn=collate_fn)
 
 print("\nTesting DataLoader...")
 src, tgt, src_mask, tgt_mask = next(iter(train_loader))
@@ -80,3 +84,28 @@ print(f"Source shape: {src.shape}")
 print(f"Target shape: {tgt.shape}")
 print(f"Source mask shape: {src_mask.shape}")
 print(f"Target mask shape: {tgt_mask.shape}")
+
+vocab_size = max(len(eng_tokens), len(ger_tokens))
+model = FullTransformer_Custom(vocab_size, heads = 8, d_model=512, hidden_lay=512, seq_len=100, num_layers=6)
+criterion = nn.CrossEntropyLoss(ignore_index=ger_tokens["<pad>"])
+optimizer = optim.Adam(model.parameters(), lr = 0.0001)
+epochs = 3
+for i in range(epochs):
+    print("Running Epoch Number", i)
+    model.train()
+    total_loss = 0
+    batch_count = 0
+    for src, tgr, _, _ in islice(train_loader, 1000):
+        tgr_input = tgr[:, :-1]
+        tgr_output = tgr[:, 1:]
+        optimizer.zero_grad()
+        output = model(src, tgr_input)
+    
+        loss = criterion(output.reshape(-1, vocab_size), tgr_output.reshape(-1))
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        optimizer.step()
+        total_loss += loss.item()
+        batch_count += 1
+    avg_loss = total_loss / batch_count
+    print(f"Epoch {i+1}/{epochs}, Loss: {avg_loss:.4f}, Perplexity: {math.exp(avg_loss):.2f}")
