@@ -21,86 +21,133 @@ class Positional_Encoding(nn.Module):  # Fixed typo: "Postional" → "Positional
     def forward(self, x):
         return x + self.pe[:, :x.size(1)]
 
-# My Custom Masking Function
 class Masked_Attention(nn.Module):
-    def __init__(self, num_heads, embedings, dropout = 0.1):
+    """Improved masked self-attention with efficient causal masking"""
+    def __init__(self, num_heads, embedings, dropout=0.1):
         super().__init__()
-        assert embedings % num_heads == 0
+        assert embedings % num_heads == 0, "embedings must be divisible by num_heads"
+        
         self.num_heads = num_heads
         self.embedings = embedings
-        self.heads = embedings // num_heads  
-        self.dropout = nn.Dropout(dropout) 
-
+        self.heads = embedings // num_heads
+        self.dropout = nn.Dropout(dropout)
+        
+        # QKV projections (keeping your original names)
         self.fc1 = nn.Linear(embedings, embedings)
         self.fc2 = nn.Linear(embedings, embedings)
         self.fc3 = nn.Linear(embedings, embedings)
         self.outlayer = nn.Linear(embedings, embedings)
-    
-    def forward(self, x):
-        batch_size, seq_len , embed = x.size()
-        Q = self.fc1(x)
-        K = self.fc2(x)
-        V = self.fc3(x)
-
-        Q = Q.view(batch_size, seq_len, self.num_heads, self.heads).transpose(1, 2)
-        K = K.view(batch_size, seq_len, self.num_heads, self.heads).transpose(1, 2)
-        V = V.view(batch_size, seq_len, self.num_heads, self.heads).transpose(1, 2)
         
-        first_term = torch.matmul(Q, K.transpose(-2, -1))
-        second_term = math.sqrt(self.heads)
-        scores = first_term/second_term
-        mask = torch.triu(torch.ones(seq_len, seq_len), diagonal=1).bool()
-        scores = scores.masked_fill(mask.to(scores.device), float('-inf'))
-
-        val = F.softmax(scores, dim=-1)
-        val = self.dropout(val)
-        output = torch.matmul(val, V)
-
-        output = output.transpose(1, 2).contiguous().view(batch_size, seq_len, embed)
-
-        out = self.outlayer(output)
-        return out
-
-# My Custom Cross Attention Function
-class Multihead(nn.Module):
-    def __init__(self, num_heads, embeding, dropout = 0.1):
-        super().__init__()
-        self.num_heads = num_heads
-        self.embeding = embeding
-        self.head = self.embeding // num_heads
-        self.dropout = nn.Dropout(dropout)
-
-        self.fc1 = nn.Linear(embeding, embeding)
-        self.fc2 = nn.Linear(embeding, embeding)
-        self.fc3 = nn.Linear(embeding, embeding)
-        self.out_layer = nn.Linear(embeding, embeding)
+        # Register causal mask as buffer (moved to device automatically)
+        self.register_buffer('causal_mask', None)
     
-    def forward(self, x, enc_output=None):
-        batch_size, seq_len, embed = x.size()
-        Q = self.fc1(x)
+    def forward(self, x, mask=None):
+        batch_size, seq_len, embed_dim = x.size()
+        
+        # Project to Q, K, V
+        Q = self.fc_q(x)
+        K = self.fc_k(x)
+        V = self.fc_v(x)
+        
+        # Reshape for multi-head attention
+        Q = Q.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        K = K.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        V = V.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        
+        # Scaled dot-product attention
+        scores = torch.matmul(Q, K.transpose(-2, -1)) / self.scale
+        
+        # Apply padding mask if provided
+        if mask is not None:
+            padding_mask = mask.unsqueeze(1).unsqueeze(2)  # [B, 1, 1, S]
+            scores = scores.masked_fill(padding_mask, float('-inf'))
+        
+        # Apply causal mask (prevents attending to future tokens)
+        if self.causal_mask is None or self.causal_mask.size(0) != seq_len:
+            # Create upper triangular matrix (1s above diagonal)
+            self.causal_mask = torch.triu(
+                torch.ones(seq_len, seq_len, device=x.device),
+                diagonal=1
+            ).bool()
+        
+        scores = scores.masked_fill(self.causal_mask, float('-inf'))
+        
+        # Softmax and dropout
+        attn_weights = F.softmax(scores, dim=-1)
+        attn_weights = self.dropout(attn_weights)
+        
+        # Apply attention to values
+        output = torch.matmul(attn_weights, V)
+        
+        # Reshape back to [B, S, E]
+        output = output.transpose(1, 2).contiguous().view(batch_size, seq_len, embed_dim)
+        
+        # Final linear projection
+        output = self.out_layer(output)
+        return output
+
+
+class Multihead_Attention(nn.Module):
+    """Improved multi-head attention for encoder and cross-attention"""
+    def __init__(self, num_heads, embeddings, dropout=0.1):
+        super().__init__()
+        assert embeddings % num_heads == 0, "embeddings must be divisible by num_heads"
+        
+        self.num_heads = num_heads
+        self.embeddings = embeddings
+        self.head_dim = embeddings // num_heads
+        self.scale = math.sqrt(self.head_dim)
+        
+        # QKV projections
+        self.fc_q = nn.Linear(embeddings, embeddings)
+        self.fc_k = nn.Linear(embeddings, embeddings)
+        self.fc_v = nn.Linear(embeddings, embeddings)
+        self.out_layer = nn.Linear(embeddings, embeddings)
+        
+        self.dropout = nn.Dropout(dropout)
+    
+    def forward(self, x, enc_output=None, mask=None):
+        batch_size, seq_len, embed_dim = x.size()
+        
+        # Query from decoder
+        Q = self.fc_q(x)
+        
+        # Key and Value from encoder (if cross-attention) or from x (self-attention)
         if enc_output is not None:
-            K = self.fc2(enc_output)
-            V = self.fc3(enc_output)
+            K = self.fc_k(enc_output)
+            V = self.fc_v(enc_output)
             seq_len_kv = enc_output.size(1)
         else:
-            K = self.fc2(x)
-            V = self.fc3(x)
+            K = self.fc_k(x)
+            V = self.fc_v(x)
             seq_len_kv = seq_len
-
-        # Split heads
-        Q = Q.view(batch_size, seq_len, self.num_heads, self.head).transpose(1, 2)
-        K = K.view(batch_size, seq_len_kv, self.num_heads, self.head).transpose(1, 2)
-        V = V.view(batch_size, seq_len_kv, self.num_heads, self.head).transpose(1, 2)
-
+        
+        # Reshape for multi-head attention
+        Q = Q.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        K = K.view(batch_size, seq_len_kv, self.num_heads, self.head_dim).transpose(1, 2)
+        V = V.view(batch_size, seq_len_kv, self.num_heads, self.head_dim).transpose(1, 2)
+        
         # Scaled dot-product attention
-        scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(self.head)
-        attn = F.softmax(scores, dim=-1)
-        attn = self.dropout(attn)
-        out = torch.matmul(attn, V)
-
-        # Combine heads
-        out = out.transpose(1, 2).contiguous().view(batch_size, seq_len, embed)
-        return self.out_layer(out)
+        scores = torch.matmul(Q, K.transpose(-2, -1)) / self.scale
+        
+        # Apply padding mask if provided
+        if mask is not None:
+            padding_mask = mask.unsqueeze(1).unsqueeze(2)  # [B, 1, 1, S]
+            scores = scores.masked_fill(padding_mask, float('-inf'))
+        
+        # Softmax and dropout
+        attn_weights = F.softmax(scores, dim=-1)
+        attn_weights = self.dropout(attn_weights)
+        
+        # Apply attention to values
+        output = torch.matmul(attn_weights, V)
+        
+        # Reshape back to [B, S, E]
+        output = output.transpose(1, 2).contiguous().view(batch_size, seq_len, embed_dim)
+        
+        # Final linear projection
+        output = self.out_layer(output)
+        return output
 
 # My Custom Postional Feed Forward Network
 class Position_Feedforward(nn.Module):

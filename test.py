@@ -104,17 +104,20 @@ for i in range(epochs):
     model.train()
     total_loss = 0
     batch_count = 0
-    for src, tgr, _, _ in train_loader:
+    for src, tgr, src_mask, tgr_mask in train_loader:
         src = src.to(device)
         tgr = tgr.to(device)
+        src_mask = src_mask.to(device)  
+        tgr_mask = tgr_mask.to(device) 
 
         tgr_input = tgr[:, :-1]
+        tgr_mask_input = tgr_mask[:, :-1]
         tgr_output = tgr[:, 1:]
         optimizer.zero_grad()
    
         #Adding Mixed Precesion to speed up the training
         with torch.cuda.amp.autocast():
-             output = model(src, tgr_input)
+             output = model(src, tgr_input, src_mask=src_mask, tgt_mask=tgr_mask_input)
              loss = criterion(output.reshape(-1, vocab_size), tgr_output.reshape(-1))
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
@@ -132,19 +135,88 @@ for i in range(epochs):
     val_loss = 0
     val_count = 0
     with torch.no_grad():
-         for src, tgr, _, _ in val_loader:
+         for src, tgr, src_mask, tgr_mask in val_loader: 
              src = src.to(device)
              tgr = tgr.to(device)
-
+             src_mask = src_mask.to(device)  
+             tgr_mask = tgr_mask.to(device)  
              tgr_input = tgr[:, :-1]
              tgr_output = tgr[:, 1:]
+             tgr_mask_input = tgr_mask[:, :-1]
         
              #Adding Mixed Precesion to speed up the training
              with torch.cuda.amp.autocast():
-                  output = model(src, tgr_input)
+                  output = model(src, tgr_input, src_mask=src_mask, tgt_mask=tgr_mask_input)
                   loss = criterion(output.reshape(-1, vocab_size), tgr_output.reshape(-1))
         
              val_loss += loss.item()
              val_count += 1
     avg_val_loss = val_loss / val_count
     print(f"Epoch {i+1}/{epochs}, Val Loss: {avg_val_loss:.4f}, Perplexity: {math.exp(avg_val_loss):.2f}\n")
+
+
+'''
+Getting Some Cacheing issues with Multi30k dataset while accessing test data so
+id this manual dowload of test data.
+TESTING CODE
+'''
+import urllib.request
+import gzip
+from pathlib import Path
+from torch.utils.data import Dataset, DataLoader
+
+# Download and prepare test data
+def download_multi30k_test():
+    """Download Multi30k test data, bypassing corrupted cache"""
+    data_dir = Path('/tmp/multi30k_manual')
+    data_dir.mkdir(exist_ok=True)
+    
+    base_url = 'https://raw.githubusercontent.com/multi30k/dataset/master/data/task1/raw/'
+    files = {'en': 'test_2016_flickr.en.gz', 'de': 'test_2016_flickr.de.gz'}
+    
+    data = {}
+    for lang, filename in files.items():
+        txt_path = data_dir / f'test_{lang}.txt'
+        
+        if not txt_path.exists():
+            urllib.request.urlretrieve(base_url + filename, data_dir / filename)
+            with gzip.open(data_dir / filename, 'rb') as f_in, open(txt_path, 'wb') as f_out:
+                f_out.write(f_in.read())
+            (data_dir / filename).unlink()  # Remove .gz
+        
+        with open(txt_path, 'r', encoding='utf-8') as f:
+            data[lang] = [line.strip() for line in f]
+    
+    return data['en'], data['de']
+
+# Simple dataset class
+class SimpleDataset(Dataset):
+    def __init__(self, src, tgt):
+        self.data = list(zip(src, tgt))
+    
+    def __len__(self):
+        return len(self.data)
+    
+    def __getitem__(self, idx):
+        return self.data[idx]
+
+# Download and test
+test_en, test_de = download_multi30k_test()
+test_loader = DataLoader(SimpleDataset(test_en, test_de), batch_size=8, collate_fn=collate_fn)
+
+# Evaluate
+model.eval()
+test_loss = 0
+with torch.no_grad():
+    for src, tgt, src_mask, tgt_mask in test_loader:
+        src, tgt = src.to(device), tgt.to(device)
+        src_mask, tgt_mask = src_mask.to(device), tgt_mask.to(device)
+        
+        tgt_input, tgt_output = tgt[:, :-1], tgt[:, 1:]
+        
+        with torch.cuda.amp.autocast():
+            output = model(src, tgt_input, src_mask=src_mask, tgt_mask=tgt_mask[:, :-1])
+            test_loss += criterion(output.reshape(-1, vocab_size), tgt_output.reshape(-1)).item()
+
+avg_test_loss = test_loss / len(test_loader)
+print(f"Test Loss: {avg_test_loss:.4f} | Perplexity: {math.exp(avg_test_loss):.2f}")

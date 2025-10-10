@@ -16,9 +16,9 @@ class Multi_Encoder(nn.Module):
         self.norm2 = nn.LayerNorm(d_model)
         self.dropout = nn.Dropout(dropout)
     
-    def forward(self, x):
+    def forward(self, x, src_mask = None):
         # Doing Encoder Stuff 
-        x1 = self.E_Multi(x)
+        x1 = self.E_Multi(x, mask=src_mask)
         x = self.norm1(x + self.dropout(x1))
 
         x2 = self.E_FeedFor(x)
@@ -37,11 +37,12 @@ class Multi_Decoder(nn.Module):
         self.norm5 = nn.LayerNorm(d_model)
         self.dropout = nn.Dropout(dropout)
     
-    def forward(self, x, enc_output):
-        x3 = self.D_Mask(x)
+    def forward(self, x, enc_output, tgt_mask=None, src_mask=None):
+        x3 = self.D_Mask(x, mask=tgt_mask)
         x = self.norm3(x+ self.dropout(x3))
         
-        x4 = self.Cross_att(x, enc_output)  
+
+        x4 = self.Cross_att(x, enc_output, mask=src_mask)  
         x = self.norm4(x + self.dropout(x4))
         
         x5 = self.D_Feedfor(x)
@@ -71,31 +72,29 @@ class FullTransformer_Custom(nn.Module):
 
         self.out_layer = nn.Linear(d_model, vocab_size)
     
-    def encoder(self, src):
+    def encoder(self, src, src_mask=None):
         # Doing Encoder Stuff 
         x = self.src_embedding(src) * math.sqrt(self.d_model)
         x = self.pos(x)
 
         for layer in self.encoder_layers:
-            x = layer(x)
+            x = layer(x, src_mask=src_mask)
         return x
     
-    def decoder(self, tar, enc_output):
+    def decoder(self, tar, enc_output, tgt_mask=None, src_mask=None):
         # Doing the Decoder Stuff
         x = self.tgt_embedding(tar) * math.sqrt(self.d_model)
         x = self.pos1(x)
         for layer in self.decoder_layers:
-            x = layer(x, enc_output)
+            x = layer(x, enc_output, tgt_mask=tgt_mask, src_mask=src_mask) 
         out = self.out_layer(x)
         return out
 
     
-    def forward(self, src, tar):
-        endcoder_output = self.encoder(src)
-        final = self.decoder(tar, endcoder_output)
-
+    def forward(self, src, tar, src_mask=None, tgt_mask=None):
+        encoder_output = self.encoder(src, src_mask=src_mask) 
+        final = self.decoder(tar, encoder_output, tgt_mask=tgt_mask, src_mask=src_mask) 
         return final
-        
 
         
 
