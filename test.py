@@ -1,5 +1,5 @@
 '''
-Willing to write the Data Loading part which gonna take care of all the 
+Willing to write the Data Loading part which gonna take care of all the
 preprocessing steps that has to be taken before feding the data to the Transformer
 '''
 import warnings
@@ -12,10 +12,9 @@ from torch.nn.utils.rnn import pad_sequence
 import torch.optim as optim
 from torchtext.data.utils import get_tokenizer
 from torchtext.vocab import build_vocab_from_iterator
-from transformer import FullTransformer_Custom
 import math
 from itertools import islice
-
+from transformer import FullTransformer_Custom
 
 # Loading the Data
 train_iter, valid_iter, test_iter = Multi30k(split=('train', 'valid', 'test'), language_pair=('en', 'de'))
@@ -28,7 +27,8 @@ tokenizer_de = get_tokenizer("spacy", language="de_core_news_sm")
 def yeild_tokens(datasets, tokenizer, index = 0):
     for data in datasets:
         yield tokenizer(data[index])
-
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f"Using device: {device}")
 # Using default build_vocab_from_iterator to find all the unique words and assigning them an integer
 #For english sentences
 eng_tokens = build_vocab_from_iterator(yeild_tokens(train_iter, tokenizer_en), specials=["<unk>", "<pad>", "<bos>", "<eos>"])
@@ -69,7 +69,7 @@ def collate_fn(batch):
         src_tensor , tgr_tensor = apply_vocab(src, tgr)
         src_list.append(src_tensor)
         tgr_list.append(tgr_tensor)
-    
+
     return padding(src_list, tgr_list)
 
 #Now we has to write a Custom Dataloader that uses this collate function
@@ -85,27 +85,66 @@ print(f"Target shape: {tgt.shape}")
 print(f"Source mask shape: {src_mask.shape}")
 print(f"Target mask shape: {tgt_mask.shape}")
 
+
+'''
+Training the Custom Transformer model with Mixied precesion and Gradient Clipping
+'''
+#Adding Validation Step after each loop
 vocab_size = max(len(eng_tokens), len(ger_tokens))
-model = FullTransformer_Custom(vocab_size, heads = 8, d_model=512, hidden_lay=512, seq_len=100, num_layers=6)
+model = FullTransformer_Custom(vocab_size, heads = 8, d_model=512, hidden_lay=1024, seq_len=100, num_layers=2)
+model = model.to(device)
 criterion = nn.CrossEntropyLoss(ignore_index=ger_tokens["<pad>"])
 optimizer = optim.Adam(model.parameters(), lr = 0.0001)
-epochs = 3
+epochs = 10
+scaler = torch.cuda.amp.GradScaler()
+
+
 for i in range(epochs):
     print("Running Epoch Number", i)
     model.train()
     total_loss = 0
     batch_count = 0
-    for src, tgr, _, _ in islice(train_loader, 1000):
+    for src, tgr, _, _ in train_loader:
+        src = src.to(device)
+        tgr = tgr.to(device)
+
         tgr_input = tgr[:, :-1]
         tgr_output = tgr[:, 1:]
         optimizer.zero_grad()
-        output = model(src, tgr_input)
-    
-        loss = criterion(output.reshape(-1, vocab_size), tgr_output.reshape(-1))
-        loss.backward()
+   
+        #Adding Mixed Precesion to speed up the training
+        with torch.cuda.amp.autocast():
+             output = model(src, tgr_input)
+             loss = criterion(output.reshape(-1, vocab_size), tgr_output.reshape(-1))
+        scaler.scale(loss).backward()
+        scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        optimizer.step()
+        scaler.step(optimizer)
+        scaler.update()
+        
         total_loss += loss.item()
         batch_count += 1
     avg_loss = total_loss / batch_count
     print(f"Epoch {i+1}/{epochs}, Loss: {avg_loss:.4f}, Perplexity: {math.exp(avg_loss):.2f}")
+
+    #Adding Validation after each Epoch to generalize the model better
+    model.eval()
+    val_loss = 0
+    val_count = 0
+    with torch.no_grad():
+         for src, tgr, _, _ in val_loader:
+             src = src.to(device)
+             tgr = tgr.to(device)
+
+             tgr_input = tgr[:, :-1]
+             tgr_output = tgr[:, 1:]
+        
+             #Adding Mixed Precesion to speed up the training
+             with torch.cuda.amp.autocast():
+                  output = model(src, tgr_input)
+                  loss = criterion(output.reshape(-1, vocab_size), tgr_output.reshape(-1))
+        
+             val_loss += loss.item()
+             val_count += 1
+    avg_val_loss = val_loss / val_count
+    print(f"Epoch {i+1}/{epochs}, Val Loss: {avg_val_loss:.4f}, Perplexity: {math.exp(avg_val_loss):.2f}\n")
