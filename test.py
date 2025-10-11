@@ -14,7 +14,7 @@ from torchtext.data.utils import get_tokenizer
 from torchtext.vocab import build_vocab_from_iterator
 import math
 from itertools import islice
-from transformer import FullTransformer_Custom
+from transformer import *
 
 # Loading the Data
 train_iter, valid_iter, test_iter = Multi30k(split=('train', 'valid', 'test'), language_pair=('en', 'de'))
@@ -89,13 +89,16 @@ print(f"Target mask shape: {tgt_mask.shape}")
 '''
 Training the Custom Transformer model with Mixied precesion and Gradient Clipping
 '''
+from torch.optim.lr_scheduler import ReduceLROnPlateau
+
 #Adding Validation Step after each loop
 vocab_size = max(len(eng_tokens), len(ger_tokens))
 model = FullTransformer_Custom(vocab_size, heads = 8, d_model=512, hidden_lay=1024, seq_len=100, num_layers=2)
 model = model.to(device)
 criterion = nn.CrossEntropyLoss(ignore_index=ger_tokens["<pad>"])
 optimizer = optim.Adam(model.parameters(), lr = 0.0001)
-epochs = 10
+scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=2, verbose=True)
+epochs = 5
 scaler = torch.cuda.amp.GradScaler()
 
 
@@ -107,14 +110,14 @@ for i in range(epochs):
     for src, tgr, src_mask, tgr_mask in train_loader:
         src = src.to(device)
         tgr = tgr.to(device)
-        src_mask = src_mask.to(device)  
-        tgr_mask = tgr_mask.to(device) 
+        src_mask = src_mask.to(device)
+        tgr_mask = tgr_mask.to(device)
 
         tgr_input = tgr[:, :-1]
         tgr_mask_input = tgr_mask[:, :-1]
         tgr_output = tgr[:, 1:]
         optimizer.zero_grad()
-   
+
         #Adding Mixed Precesion to speed up the training
         with torch.cuda.amp.autocast():
              output = model(src, tgr_input, src_mask=src_mask, tgt_mask=tgr_mask_input)
@@ -124,7 +127,7 @@ for i in range(epochs):
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         scaler.step(optimizer)
         scaler.update()
-        
+
         total_loss += loss.item()
         batch_count += 1
     avg_loss = total_loss / batch_count
@@ -135,74 +138,93 @@ for i in range(epochs):
     val_loss = 0
     val_count = 0
     with torch.no_grad():
-         for src, tgr, src_mask, tgr_mask in val_loader: 
+         for src, tgr, src_mask, tgr_mask in val_loader:
              src = src.to(device)
              tgr = tgr.to(device)
-             src_mask = src_mask.to(device)  
-             tgr_mask = tgr_mask.to(device)  
+             src_mask = src_mask.to(device)
+             tgr_mask = tgr_mask.to(device)
              tgr_input = tgr[:, :-1]
              tgr_output = tgr[:, 1:]
              tgr_mask_input = tgr_mask[:, :-1]
-        
+
              #Adding Mixed Precesion to speed up the training
              with torch.cuda.amp.autocast():
                   output = model(src, tgr_input, src_mask=src_mask, tgt_mask=tgr_mask_input)
                   loss = criterion(output.reshape(-1, vocab_size), tgr_output.reshape(-1))
-        
+
              val_loss += loss.item()
              val_count += 1
     avg_val_loss = val_loss / val_count
     print(f"Epoch {i+1}/{epochs}, Val Loss: {avg_val_loss:.4f}, Perplexity: {math.exp(avg_val_loss):.2f}\n")
+    scheduler.step(avg_val_loss)
 
 
-'''
-Getting Some Cacheing issues with Multi30k dataset while accessing test data so
-id this manual dowload of test data.
-TESTING CODE
-'''
+#Saving the Model
+# Save the model after training completes
+torch.save({
+    'epoch': epochs,
+    'model_state_dict': model.state_dict(),
+    'optimizer_state_dict': optimizer.state_dict(),
+    'scheduler_state_dict': scheduler.state_dict(),
+    'train_loss': avg_loss,
+    'val_loss': avg_val_loss,
+}, 'transformer_model.pth')
+
+print("Model saved successfully!")
+
+
+#TESTING THE TRANSFORMER ON TEST DATA
+
 import urllib.request
 import gzip
 from pathlib import Path
 from torch.utils.data import Dataset, DataLoader
+
 
 # Download and prepare test data
 def download_multi30k_test():
     """Download Multi30k test data, bypassing corrupted cache"""
     data_dir = Path('/tmp/multi30k_manual')
     data_dir.mkdir(exist_ok=True)
-    
+
     base_url = 'https://raw.githubusercontent.com/multi30k/dataset/master/data/task1/raw/'
     files = {'en': 'test_2016_flickr.en.gz', 'de': 'test_2016_flickr.de.gz'}
-    
+
     data = {}
     for lang, filename in files.items():
         txt_path = data_dir / f'test_{lang}.txt'
-        
+
         if not txt_path.exists():
             urllib.request.urlretrieve(base_url + filename, data_dir / filename)
             with gzip.open(data_dir / filename, 'rb') as f_in, open(txt_path, 'wb') as f_out:
                 f_out.write(f_in.read())
             (data_dir / filename).unlink()  # Remove .gz
-        
+
         with open(txt_path, 'r', encoding='utf-8') as f:
             data[lang] = [line.strip() for line in f]
-    
+
     return data['en'], data['de']
 
 # Simple dataset class
 class SimpleDataset(Dataset):
     def __init__(self, src, tgt):
         self.data = list(zip(src, tgt))
-    
+
     def __len__(self):
         return len(self.data)
-    
+
     def __getitem__(self, idx):
         return self.data[idx]
 
 # Download and test
 test_en, test_de = download_multi30k_test()
 test_loader = DataLoader(SimpleDataset(test_en, test_de), batch_size=8, collate_fn=collate_fn)
+
+#Loading the Saved Model
+checkpoint = torch.load('transformer_model.pth', map_location=device)  # Changed to match your save name
+model.load_state_dict(checkpoint['model_state_dict'])
+print(f"Model loaded from epoch {checkpoint['epoch']}")
+print(f"Saved Val Loss: {checkpoint['val_loss']:.4f}\n")
 
 # Evaluate
 model.eval()
@@ -211,9 +233,9 @@ with torch.no_grad():
     for src, tgt, src_mask, tgt_mask in test_loader:
         src, tgt = src.to(device), tgt.to(device)
         src_mask, tgt_mask = src_mask.to(device), tgt_mask.to(device)
-        
+
         tgt_input, tgt_output = tgt[:, :-1], tgt[:, 1:]
-        
+
         with torch.cuda.amp.autocast():
             output = model(src, tgt_input, src_mask=src_mask, tgt_mask=tgt_mask[:, :-1])
             test_loss += criterion(output.reshape(-1, vocab_size), tgt_output.reshape(-1)).item()
