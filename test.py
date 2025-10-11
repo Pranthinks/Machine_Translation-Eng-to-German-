@@ -93,14 +93,14 @@ from torch.optim.lr_scheduler import ReduceLROnPlateau
 
 #Adding Validation Step after each loop
 vocab_size = max(len(eng_tokens), len(ger_tokens))
-model = FullTransformer_Custom(vocab_size, heads = 8, d_model=512, hidden_lay=1024, seq_len=100, num_layers=2)
+model = FullTransformer_Custom(vocab_size, heads = 8, d_model=512, hidden_lay=2048, seq_len=100, num_layers=6)
 model = model.to(device)
 criterion = nn.CrossEntropyLoss(ignore_index=ger_tokens["<pad>"])
 optimizer = optim.Adam(model.parameters(), lr = 0.0001)
 scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=2, verbose=True)
-epochs = 5
+epochs = 15
 scaler = torch.cuda.amp.GradScaler()
-
+best_val_loss = float('inf')
 
 for i in range(epochs):
     print("Running Epoch Number", i)
@@ -157,6 +157,17 @@ for i in range(epochs):
     avg_val_loss = val_loss / val_count
     print(f"Epoch {i+1}/{epochs}, Val Loss: {avg_val_loss:.4f}, Perplexity: {math.exp(avg_val_loss):.2f}\n")
     scheduler.step(avg_val_loss)
+    if avg_val_loss < best_val_loss:
+        best_val_loss = avg_val_loss
+        torch.save({
+            'epoch': i + 1,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'scheduler_state_dict': scheduler.state_dict(),
+            'train_loss': avg_loss,
+            'val_loss': avg_val_loss,
+        }, 'best_transformer_model.pth')
+        print(f"✓ Best model saved! Val Loss: {avg_val_loss:.4f}\n")
 
 
 #Saving the Model
@@ -168,10 +179,11 @@ torch.save({
     'scheduler_state_dict': scheduler.state_dict(),
     'train_loss': avg_loss,
     'val_loss': avg_val_loss,
-}, 'transformer_model.pth')
-
-print("Model saved successfully!")
-
+}, 'final_transformer_model.pth')
+print(f"Training complete!")
+print(f"Best validation loss: {best_val_loss:.4f}")
+print(f"Final model saved as 'final_transformer_model.pth'")
+print(f"Best model saved as 'best_transformer_model.pth'")
 
 #TESTING THE TRANSFORMER ON TEST DATA
 
@@ -221,7 +233,7 @@ test_en, test_de = download_multi30k_test()
 test_loader = DataLoader(SimpleDataset(test_en, test_de), batch_size=8, collate_fn=collate_fn)
 
 #Loading the Saved Model
-checkpoint = torch.load('transformer_model.pth', map_location=device)  # Changed to match your save name
+checkpoint = torch.load('best_transformer_model.pth', map_location=device)  # Changed to match your save name
 model.load_state_dict(checkpoint['model_state_dict'])
 print(f"Model loaded from epoch {checkpoint['epoch']}")
 print(f"Saved Val Loss: {checkpoint['val_loss']:.4f}\n")
@@ -242,3 +254,81 @@ with torch.no_grad():
 
 avg_test_loss = test_loss / len(test_loader)
 print(f"Test Loss: {avg_test_loss:.4f} | Perplexity: {math.exp(avg_test_loss):.2f}")
+
+
+#TESTING THIS MODEL ON MY CUSTOM INPUTS
+def translate_sentence_beam(sentence, model, eng_tokens, ger_tokens, device, max_len=100, beam_width=5):
+    """Translate using beam search for better results"""
+    model.eval()
+    
+    tokens = tokenizer_en(sentence.lower())
+    src_indices = [eng_tokens["<bos>"]] + [eng_tokens[t] for t in tokens] + [eng_tokens["<eos>"]]
+    
+    if len(src_indices) < max_len:
+        src_indices += [eng_tokens["<pad>"]] * (max_len - len(src_indices))
+    else:
+        src_indices = src_indices[:max_len]
+    
+    src = torch.tensor([src_indices]).to(device)
+    src_mask = (src == eng_tokens["<pad>"]).unsqueeze(1).unsqueeze(2).to(device)
+    
+    # Initialize beam: list of (sequence, score)
+    beams = [([ger_tokens["<bos>"]], 0.0)]
+    
+    with torch.no_grad():
+        for _ in range(max_len - 1):
+            all_candidates = []
+            
+            for seq, score in beams:
+                if seq[-1] == ger_tokens["<eos>"]:
+                    all_candidates.append((seq, score))
+                    continue
+                
+                tgt_padded = seq + [ger_tokens["<pad>"]] * (max_len - len(seq))
+                tgt = torch.tensor([tgt_padded]).to(device)
+                tgt_mask = (tgt == ger_tokens["<pad>"]).unsqueeze(1).unsqueeze(2).to(device)
+                
+                with torch.cuda.amp.autocast():
+                    output = model(src, tgt, src_mask=src_mask, tgt_mask=tgt_mask)
+                
+                # Get top k predictions
+                logits = output[0, len(seq) - 1]
+                log_probs = torch.log_softmax(logits, dim=-1)
+                top_probs, top_indices = torch.topk(log_probs, beam_width)
+                
+                for prob, idx in zip(top_probs, top_indices):
+                    new_seq = seq + [idx.item()]
+                    new_score = score + prob.item()
+                    all_candidates.append((new_seq, new_score))
+            
+            # Keep top beam_width sequences
+            beams = sorted(all_candidates, key=lambda x: x[1], reverse=True)[:beam_width]
+            
+            # Stop if all beams end with <eos>
+            if all(seq[-1] == ger_tokens["<eos>"] for seq, _ in beams):
+                break
+    
+    # Get best sequence
+    best_seq = beams[0][0]
+    ger_vocab_list = ger_tokens.get_itos()
+    translated_tokens = [ger_vocab_list[idx] for idx in best_seq[1:-1]]
+    
+    return ' '.join(translated_tokens)
+
+
+# Test on custom sentences
+test_sentences = [
+    "a dog is running in the park",
+    "the cat is sleeping on the bed",
+    "two people are walking together",
+    "children are playing with a ball"
+]
+
+print("=" * 60)
+print("CUSTOM SENTENCE TRANSLATIONS")
+print("=" * 60)
+
+for sentence in test_sentences:
+    translation = translate_sentence_beam(sentence, model, eng_tokens, ger_tokens, device)
+    print(f"\nEnglish:  {sentence}")
+    print(f"German:   {translation}")
