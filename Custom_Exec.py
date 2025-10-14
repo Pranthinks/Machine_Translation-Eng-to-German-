@@ -14,7 +14,7 @@ from torchtext.data.utils import get_tokenizer
 from torchtext.vocab import build_vocab_from_iterator
 import math
 from itertools import islice
-from transformer import *
+from Custom_Transformer import *
 
 # Loading the Data
 train_iter, valid_iter, test_iter = Multi30k(split=('train', 'valid', 'test'), language_pair=('en', 'de'))
@@ -31,12 +31,12 @@ device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f"Using device: {device}")
 # Using default build_vocab_from_iterator to find all the unique words and assigning them an integer
 #For english sentences
-eng_tokens = build_vocab_from_iterator(yeild_tokens(train_iter, tokenizer_en), specials=["<unk>", "<pad>", "<bos>", "<eos>"])
+eng_tokens = build_vocab_from_iterator(yeild_tokens(train_iter, tokenizer_en), specials=["<unk>", "<pad>", "<bos>", "<eos>"], max_tokens=8000)
 eng_tokens.set_default_index(eng_tokens["<unk>"])
 
 train_iter, valid_iter, test_iter = Multi30k(split=('train', 'valid', 'test'), language_pair=('en', 'de'))
 #For German Sentences so keeping the index as 1
-ger_tokens = build_vocab_from_iterator(yeild_tokens(train_iter, tokenizer_de, index=1), specials=["<unk>", "<pad>", "<bos>", "<eos>"])
+ger_tokens = build_vocab_from_iterator(yeild_tokens(train_iter, tokenizer_de, index=1), specials=["<unk>", "<pad>", "<bos>", "<eos>"], max_tokens=8000)
 ger_tokens.set_default_index(ger_tokens["<unk>"])
 #print(len(eng_tokens))
 #print(len(ger_tokens))
@@ -74,9 +74,9 @@ def collate_fn(batch):
 
 #Now we has to write a Custom Dataloader that uses this collate function
 train_iter, valid_iter, test_iter = Multi30k(split=('train', 'valid', 'test'), language_pair=('en', 'de'))
-train_loader = DataLoader(train_iter, batch_size = 8, collate_fn=collate_fn)
-val_loader = DataLoader(valid_iter, batch_size = 8, collate_fn=collate_fn)
-test_loader = DataLoader(test_iter, batch_size = 8, collate_fn=collate_fn)
+train_loader = DataLoader(train_iter, batch_size = 32, collate_fn=collate_fn)
+val_loader = DataLoader(valid_iter, batch_size = 32, collate_fn=collate_fn)
+test_loader = DataLoader(test_iter, batch_size = 32, collate_fn=collate_fn)
 
 print("\nTesting DataLoader...")
 src, tgt, src_mask, tgt_mask = next(iter(train_loader))
@@ -86,6 +86,7 @@ print(f"Source mask shape: {src_mask.shape}")
 print(f"Target mask shape: {tgt_mask.shape}")
 
 
+
 '''
 Training the Custom Transformer model with Mixied precesion and Gradient Clipping
 '''
@@ -93,12 +94,27 @@ from torch.optim.lr_scheduler import ReduceLROnPlateau
 
 #Adding Validation Step after each loop
 vocab_size = max(len(eng_tokens), len(ger_tokens))
-model = FullTransformer_Custom(vocab_size, heads = 8, d_model=512, hidden_lay=2048, seq_len=100, num_layers=6)
+model = FullTransformer_Custom(vocab_size, heads = 8, d_model=256, hidden_lay=512, seq_len=100, num_layers=3, dropout=0.2)
 model = model.to(device)
-criterion = nn.CrossEntropyLoss(ignore_index=ger_tokens["<pad>"])
-optimizer = optim.Adam(model.parameters(), lr = 0.0001)
-scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=2, verbose=True)
-epochs = 15
+criterion = nn.CrossEntropyLoss(
+    ignore_index=ger_tokens["<pad>"],
+    label_smoothing=0.1
+)
+optimizer = optim.AdamW(  # Changed from Adam
+    model.parameters(),
+    lr=0.0001,           # Reduced from 0.0003
+    betas=(0.9, 0.98),
+    eps=1e-9,
+    weight_decay=0.01
+)
+scheduler = ReduceLROnPlateau(
+    optimizer,
+    mode='min',
+    factor=0.5,
+    patience=3,          # Reduced from 5
+    min_lr=1e-6
+)
+epochs = 30
 scaler = torch.cuda.amp.GradScaler()
 best_val_loss = float('inf')
 
@@ -124,7 +140,7 @@ for i in range(epochs):
              loss = criterion(output.reshape(-1, vocab_size), tgr_output.reshape(-1))
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
         scaler.step(optimizer)
         scaler.update()
 
@@ -185,13 +201,13 @@ print(f"Best validation loss: {best_val_loss:.4f}")
 print(f"Final model saved as 'final_transformer_model.pth'")
 print(f"Best model saved as 'best_transformer_model.pth'")
 
+
 #TESTING THE TRANSFORMER ON TEST DATA
 
 import urllib.request
 import gzip
 from pathlib import Path
 from torch.utils.data import Dataset, DataLoader
-
 
 # Download and prepare test data
 def download_multi30k_test():
@@ -207,17 +223,17 @@ def download_multi30k_test():
         txt_path = data_dir / f'test_{lang}.txt'
 
         if not txt_path.exists():
+            print(f"Downloading {lang} test data...")
             urllib.request.urlretrieve(base_url + filename, data_dir / filename)
             with gzip.open(data_dir / filename, 'rb') as f_in, open(txt_path, 'wb') as f_out:
                 f_out.write(f_in.read())
-            (data_dir / filename).unlink()  # Remove .gz
+            (data_dir / filename).unlink()
 
         with open(txt_path, 'r', encoding='utf-8') as f:
             data[lang] = [line.strip() for line in f]
 
     return data['en'], data['de']
 
-# Simple dataset class
 class SimpleDataset(Dataset):
     def __init__(self, src, tgt):
         self.data = list(zip(src, tgt))
@@ -228,95 +244,217 @@ class SimpleDataset(Dataset):
     def __getitem__(self, idx):
         return self.data[idx]
 
-# Download and test
+# Download test data
+print("Downloading test data...")
 test_en, test_de = download_multi30k_test()
-test_loader = DataLoader(SimpleDataset(test_en, test_de), batch_size=8, collate_fn=collate_fn)
+print(f"Test set size: {len(test_en)} examples\n")
 
-#Loading the Saved Model
-checkpoint = torch.load('best_transformer_model.pth', map_location=device)  # Changed to match your save name
-model.load_state_dict(checkpoint['model_state_dict'])
-print(f"Model loaded from epoch {checkpoint['epoch']}")
-print(f"Saved Val Loss: {checkpoint['val_loss']:.4f}\n")
+test_loader = DataLoader(
+    SimpleDataset(test_en, test_de),
+    batch_size=8,
+    collate_fn=collate_fn,
+    shuffle=False
+)
 
-# Evaluate
+# Recreate model with the EXACT architecture that was saved
+print("Recreating model to match checkpoint...")
+vocab_size = max(len(eng_tokens), len(ger_tokens))
+model = FullTransformer_Custom(
+    vocab_size,
+    heads=8,
+    d_model=256,
+    hidden_lay=512,  # Your checkpoint was trained with 1024, NOT 2048
+    seq_len=100,
+    num_layers=3
+)
+model = model.to(device)
+
+# Load the best model weights
+print("Loading best model weights...")
+checkpoint = torch.load('best_transformer_model.pth', map_location=device)
+model.load_state_dict(checkpoint['model_state_dict'], strict=False)
+print(f"✓ Model loaded from epoch {checkpoint['epoch']}")
+print(f"✓ Best Val Loss: {checkpoint['val_loss']:.4f}\n")
+
+# Evaluate on test set
+print("Evaluating on test set...")
 model.eval()
 test_loss = 0
+batch_count = 0
+
 with torch.no_grad():
     for src, tgt, src_mask, tgt_mask in test_loader:
-        src, tgt = src.to(device), tgt.to(device)
-        src_mask, tgt_mask = src_mask.to(device), tgt_mask.to(device)
+        src = src.to(device)
+        tgt = tgt.to(device)
+        src_mask = src_mask.to(device)
+        tgt_mask = tgt_mask.to(device)
 
-        tgt_input, tgt_output = tgt[:, :-1], tgt[:, 1:]
+        tgt_input = tgt[:, :-1]
+        tgt_output = tgt[:, 1:]
+        tgt_mask_input = tgt_mask[:, :-1]
 
         with torch.cuda.amp.autocast():
-            output = model(src, tgt_input, src_mask=src_mask, tgt_mask=tgt_mask[:, :-1])
-            test_loss += criterion(output.reshape(-1, vocab_size), tgt_output.reshape(-1)).item()
+            output = model(src, tgt_input, src_mask=src_mask, tgt_mask=tgt_mask_input)
+            loss = criterion(output.reshape(-1, vocab_size), tgt_output.reshape(-1))
 
-avg_test_loss = test_loss / len(test_loader)
-print(f"Test Loss: {avg_test_loss:.4f} | Perplexity: {math.exp(avg_test_loss):.2f}")
+        test_loss += loss.item()
+        batch_count += 1
+
+avg_test_loss = test_loss / batch_count
+test_perplexity = math.exp(avg_test_loss)
+
+print("\n" + "="*50)
+print("TEST RESULTS")
+print("="*50)
+print(f"Test Loss:       {avg_test_loss:.4f}")
+print(f"Test Perplexity: {test_perplexity:.2f}")
+print(f"Batches:         {batch_count}")
+print("="*50)
 
 
-#TESTING THIS MODEL ON MY CUSTOM INPUTS
-def translate_sentence_beam(sentence, model, eng_tokens, ger_tokens, device, max_len=100, beam_width=5):
-    """Translate using beam search for better results"""
+def translate_sentence_greedy(sentence, model, eng_tokens, ger_tokens, device, max_len=100):
+    """Simple greedy decoding with CORRECT mask format"""
     model.eval()
-    
+
+    # Get vocab mappings
+    eng_stoi = eng_tokens.get_stoi()
+    ger_stoi = ger_tokens.get_stoi()
+    ger_itos = ger_tokens.get_itos()
+
+    # Tokenize source
     tokens = tokenizer_en(sentence.lower())
-    src_indices = [eng_tokens["<bos>"]] + [eng_tokens[t] for t in tokens] + [eng_tokens["<eos>"]]
-    
+    src_indices = [eng_stoi["<bos>"]] + [eng_stoi.get(t, eng_stoi["<unk>"]) for t in tokens] + [eng_stoi["<eos>"]]
+
+    # Pad source
+    src_len = len(src_indices)
     if len(src_indices) < max_len:
-        src_indices += [eng_tokens["<pad>"]] * (max_len - len(src_indices))
+        src_indices += [eng_stoi["<pad>"]] * (max_len - len(src_indices))
     else:
         src_indices = src_indices[:max_len]
-    
+
     src = torch.tensor([src_indices]).to(device)
-    src_mask = (src == eng_tokens["<pad>"]).unsqueeze(1).unsqueeze(2).to(device)
-    
-    # Initialize beam: list of (sequence, score)
-    beams = [([ger_tokens["<bos>"]], 0.0)]
-    
+
+    # FIXED: Source mask - True for PAD tokens (to mask them out)
+    src_mask = (src == eng_stoi["<pad>"])  # Shape: [batch, seq_len]
+
+    # Start with <bos>
+    tgt_indices = [ger_stoi["<bos>"]]
+
     with torch.no_grad():
         for _ in range(max_len - 1):
+            seq_len = len(tgt_indices)
+
+            # Pad current target
+            tgt_padded = tgt_indices + [ger_stoi["<pad>"]] * (max_len - seq_len)
+            tgt = torch.tensor([tgt_padded]).to(device)
+
+            # FIXED: Target mask - True for PAD tokens
+            tgt_mask = (tgt == ger_stoi["<pad>"])  # Shape: [batch, seq_len]
+
+            with torch.cuda.amp.autocast():
+                output = model(src, tgt, src_mask=src_mask, tgt_mask=tgt_mask)
+
+            # Get next token from the LAST GENERATED position
+            next_token = output[0, seq_len - 1].argmax().item()
+
+            if next_token == ger_stoi["<eos>"]:
+                break
+
+            tgt_indices.append(next_token)
+
+    # Convert to words
+    translated_tokens = []
+    for idx in tgt_indices[1:]:  # Skip <bos>
+        if idx == ger_stoi["<eos>"]:
+            break
+        token = ger_itos[idx]
+        if token not in ["<bos>", "<eos>", "<pad>", "<unk>"]:
+            translated_tokens.append(token)
+
+    return ' '.join(translated_tokens) if translated_tokens else "<empty>"
+
+
+def translate_sentence_beam(sentence, model, eng_tokens, ger_tokens, device, max_len=100, beam_width=5):
+    """Translate using beam search with CORRECT mask format"""
+    model.eval()
+
+    # Tokenize source
+    tokens = tokenizer_en(sentence.lower())
+
+    # Get vocab mappings
+    eng_stoi = eng_tokens.get_stoi()
+    ger_stoi = ger_tokens.get_stoi()
+
+    src_indices = [eng_stoi["<bos>"]] + [eng_stoi.get(t, eng_stoi["<unk>"]) for t in tokens] + [eng_stoi["<eos>"]]
+
+    # Pad source to max_len
+    if len(src_indices) < max_len:
+        src_indices += [eng_stoi["<pad>"]] * (max_len - len(src_indices))
+    else:
+        src_indices = src_indices[:max_len]
+
+    src = torch.tensor([src_indices]).to(device)
+
+    # FIXED: Source mask - True for PAD tokens
+    src_mask = (src == eng_stoi["<pad>"])
+
+    # Initialize beam
+    beams = [([ger_stoi["<bos>"]], 0.0)]
+
+    with torch.no_grad():
+        for step in range(max_len - 1):
             all_candidates = []
-            
+
             for seq, score in beams:
-                if seq[-1] == ger_tokens["<eos>"]:
+                if seq[-1] == ger_stoi["<eos>"]:
                     all_candidates.append((seq, score))
                     continue
-                
-                tgt_padded = seq + [ger_tokens["<pad>"]] * (max_len - len(seq))
+
+                seq_len = len(seq)
+
+                # Pad target to max_len
+                tgt_padded = seq + [ger_stoi["<pad>"]] * (max_len - seq_len)
                 tgt = torch.tensor([tgt_padded]).to(device)
-                tgt_mask = (tgt == ger_tokens["<pad>"]).unsqueeze(1).unsqueeze(2).to(device)
-                
+
+                # FIXED: Target mask - True for PAD tokens
+                tgt_mask = (tgt == ger_stoi["<pad>"])
+
                 with torch.cuda.amp.autocast():
                     output = model(src, tgt, src_mask=src_mask, tgt_mask=tgt_mask)
-                
-                # Get top k predictions
-                logits = output[0, len(seq) - 1]
+
+                # Get logits for last valid position
+                logits = output[0, seq_len - 1]
                 log_probs = torch.log_softmax(logits, dim=-1)
                 top_probs, top_indices = torch.topk(log_probs, beam_width)
-                
+
                 for prob, idx in zip(top_probs, top_indices):
                     new_seq = seq + [idx.item()]
                     new_score = score + prob.item()
                     all_candidates.append((new_seq, new_score))
-            
+
             # Keep top beam_width sequences
-            beams = sorted(all_candidates, key=lambda x: x[1], reverse=True)[:beam_width]
-            
-            # Stop if all beams end with <eos>
-            if all(seq[-1] == ger_tokens["<eos>"] for seq, _ in beams):
+            beams = sorted(all_candidates, key=lambda x: x[1] / len(x[0]), reverse=True)[:beam_width]
+
+            if all(seq[-1] == ger_stoi["<eos>"] for seq, _ in beams):
                 break
-    
+
     # Get best sequence
     best_seq = beams[0][0]
-    ger_vocab_list = ger_tokens.get_itos()
-    translated_tokens = [ger_vocab_list[idx] for idx in best_seq[1:-1]]
-    
-    return ' '.join(translated_tokens)
+    ger_itos = ger_tokens.get_itos()
+
+    # Convert to words
+    translated_tokens = []
+    for idx in best_seq[1:]:
+        if idx == ger_stoi["<eos>"]:
+            break
+        token = ger_itos[idx]
+        if token not in ["<bos>", "<eos>", "<pad>", "<unk>"]:
+            translated_tokens.append(token)
+
+    return ' '.join(translated_tokens) if translated_tokens else "<empty>"
 
 
-# Test on custom sentences
+# Test
 test_sentences = [
     "a dog is running in the park",
     "the cat is sleeping on the bed",
@@ -325,10 +463,19 @@ test_sentences = [
 ]
 
 print("=" * 60)
-print("CUSTOM SENTENCE TRANSLATIONS")
+print("GREEDY DECODING")
 print("=" * 60)
 
 for sentence in test_sentences:
-    translation = translate_sentence_beam(sentence, model, eng_tokens, ger_tokens, device)
+    translation = translate_sentence_greedy(sentence, model, eng_tokens, ger_tokens, device)
+    print(f"\nEnglish:  {sentence}")
+    print(f"German:   {translation}")
+
+print("\n" + "=" * 60)
+print("BEAM SEARCH (width=5)")
+print("=" * 60)
+
+for sentence in test_sentences:
+    translation = translate_sentence_beam(sentence, model, eng_tokens, ger_tokens, device, beam_width=5)
     print(f"\nEnglish:  {sentence}")
     print(f"German:   {translation}")

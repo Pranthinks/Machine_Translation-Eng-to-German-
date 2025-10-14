@@ -1,0 +1,14 @@
+numpy<2
+torch==2.2.2
+torchtext==0.17.2
+torchdata==0.7.1
+portalocker==2.7.0
+transformers
+datasets
+sacrebleu
+bitsandbytes
+accelerate
+evaluate
+spacy
+en-core-web-sm @ https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.7.1/en_core_web_sm-3.7.1-py3-none-any.whl
+de-core-news-sm @ https://github.com/explosion/spacy-models/releases/download/de_core_news_sm-3.7.0/de_core_news_sm-3.7.0-py3-none-any.whl
